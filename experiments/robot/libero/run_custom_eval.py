@@ -4,7 +4,7 @@ run_libero_eval.py
 Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 """
 
-import json
+import pickle
 import logging
 import os
 import sys
@@ -13,6 +13,12 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
+from libero.libero.envs import OffScreenRenderEnv
+from IPython.display import display
+from PIL import Image
+from libero.libero.utils.bddl_generation_utils import get_xy_region_kwargs_list_from_regions_info
+from libero.libero.utils.mu_utils import register_mu, InitialSceneTemplates
+from libero.libero.utils.task_generation_utils import register_task_info, get_task_info, generate_bddl_from_task_info
 
 import draccus
 import numpy as np
@@ -106,11 +112,12 @@ class GenerateConfig:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
+    task_suite_name: str = TaskSuite.LIBERO_OBJECT  # Task suite
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 5                   # Number of rollouts per task
-    initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
+    num_trials_per_task: int = 20                   # Number of rollouts per task
+    initial_states_path: str = "/home/joe/LIBERO/notebooks/init_states/initial_states18.pkl" # "DEFAULT", or path to initial states file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
+    bddl_file  = "/home/joe/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_chocolate_pudding_and_place_it_in_the_basket.bddl"
 
     #################################################################################################################
     # Utils
@@ -221,22 +228,6 @@ def log_message(message: str, log_file=None):
         log_file.flush()
 
 
-def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
-    """Load initial states for the given task."""
-    # Get default initial states
-    initial_states = task_suite.get_task_init_states(task_id)
-
-    # If using custom initial states, load them from file
-    if cfg.initial_states_path != "DEFAULT":
-        with open(cfg.initial_states_path, "r") as f:
-            all_initial_states = json.load(f)
-        log_message(f"Using initial states from {cfg.initial_states_path}", log_file)
-        return initial_states, all_initial_states
-    else:
-        log_message("Using default initial states", log_file)
-        return initial_states, None
-
-
 def prepare_observation(obs, resize_size):
     """Prepare observation for policy input."""
     # Get preprocessed images
@@ -288,13 +279,8 @@ def run_episode(
     """Run a single episode in the environment."""
     # Reset environment
     env.reset()
-    test = env.get_sim_state()
-    # Set initial state if provided
-    if initial_state is not None:
-        obs = env.set_init_state(initial_state)
-    else:
-        obs = env.get_observation()
-    breakpoint()
+    obs = env.set_init_state(initial_state)
+
     # Initialize action queue
     if cfg.num_open_loop_steps != NUM_ACTIONS_CHUNK:
         print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
@@ -358,8 +344,7 @@ def run_episode(
 
 def run_task(
     cfg: GenerateConfig,
-    task_suite,
-    task_id: int,
+    env,
     model,
     resize_size,
     processor=None,
@@ -370,46 +355,17 @@ def run_task(
     total_successes=0,
     log_file=None,
 ):
-    """Run evaluation for a single task."""
-    # Get task
-    task = task_suite.get_task(task_id)
-
-    # Get initial states
-    initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
-    num_demos = initial_states.shape[0] 
-    # print(f"\n--- Printing initial_states[demo_index][10:12] for {num_demos} demos ---")
-    # # Loop through each demo index (0 to 49)
-    # for i in range(num_demos):
-    #     values_slice = initial_states[i, 10:12] 
-    #     print(f"Demo index {i}: initial_state[10:12] = {values_slice}")
-    #breakpoint()
-    # Initialize environment and get task description
-    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+    task_description = env.language_instruction
+    # Load initial states
+    with open(cfg.initial_states_path, "rb") as f:
+        initial_states = pickle.load(f)
 
     # Start episodes
     task_episodes, task_successes = 0, 0
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
-        log_message(f"\nTask: {task_description}", log_file)
-
-        # Handle initial state
-        if cfg.initial_states_path == "DEFAULT":
-            # Use default initial state
-            initial_state = initial_states[episode_idx]
-        else:
-            # Get keys for fetching initial episode state from JSON
-            initial_states_task_key = task_description.replace(" ", "_")
-            episode_key = f"demo_{episode_idx}"
-
-            # Skip episode if expert demonstration failed to complete the task
-            if not all_initial_states[initial_states_task_key][episode_key]["success"]:
-                log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
-                continue
-
-            # Get initial state
-            initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
-
+        # Load initial state
+        initial_state = initial_states[episode_idx]
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
-
         # Run episode
         success, replay_images = run_episode(
             cfg,
@@ -479,32 +435,31 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
 
-    # Initialize LIBERO task suite
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
-    num_tasks = task_suite.n_tasks
-    log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+    #TODO: Clean up bddl file setting
+    bddl_file = cfg.bddl_file
+    env_args = {
+        "bddl_file_name": bddl_file,
+        "camera_heights": 256,
+        "camera_widths": 256
+    }
+    env = OffScreenRenderEnv(**env_args)
+
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
-        #TODO: Only run if its chocolate pudding task
-        task = task_suite.get_task(task_id)
-        if task.name=="pick_up_the_chocolate_pudding_and_place_it_in_the_basket":
-            total_episodes, total_successes = run_task(
-                cfg,
-                task_suite,
-                task_id,
-                model,
-                resize_size,
-                processor,
-                action_head,
-                proprio_projector,
-                noisy_action_projector,
-                total_episodes,
-                total_successes,
-                log_file,
-            )
+    total_episodes, total_successes = run_task(
+        cfg,
+        env,
+        model,
+        resize_size,
+        processor,
+        action_head,
+        proprio_projector,
+        noisy_action_projector,
+        total_episodes,
+        total_successes,
+        log_file,
+    )
 
     # Calculate final success rate
     final_success_rate = float(total_successes) / float(total_episodes) if total_episodes > 0 else 0
